@@ -1,0 +1,53 @@
+{
+  "name": "prometheus-wiki-loop",
+  "version": "1.0.0",
+  "description": "Universal session-close + session-prime + MCP server for the Prometheus self-learning loop. Three small scripts that turn any AI session into a contribution to a shared knowledge base.",
+  "license": "MIT",
+  "main": "bin/wiki-loop-mcp",
+  "bin": {
+    "kbd-close": "bin/kbd-close",
+    "kbd-open": "bin/kbd-open",
+    "wiki-loop-mcp": "bin/wiki-loop-mcp"
+  },
+  "files": [
+    "bin/",
+    "scripts/",
+    "docs/",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "install": "scripts/install.sh",
+    "test": "bash scripts/smoke-test.sh"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {},
+  "keywords": [
+    "ai",
+    "agents",
+    "claude-code",
+    "opencode",
+    "codex",
+    "kimi",
+    "mcp",
+    "model-context-protocol",
+    "knowledge-management",
+    "self-learning",
+    "karpathy",
+    "continuous-improvement",
+    "wiki",
+    "prometheus"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Prometheus-AGS/prometheus-wiki-loop.git"
+  },
+  "author": {
+    "name": "Travis James",
+    "url": "https://travisjames.ai"
+  },
+  "homepage": "https://github.com/Prometheus-AGS/prometheus-wiki-loop",
+  "bugs": "https://github.com/Prometheus-AGS/prometheus-wiki-loop/issues"
+}

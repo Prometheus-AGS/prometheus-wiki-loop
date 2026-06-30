@@ -1,0 +1,6 @@
+bin/
+node_modules/
+*.log
+.env
+.DS_Store
+target/
