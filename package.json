@@ -7,8 +7,7 @@
   "bin": {
     "kbd-close": "bin/kbd-close",
     "kbd-open": "bin/kbd-open",
-    "wiki-loop-mcp": "bin/wiki-loop-mcp",
-    "learn-grade": "bin/learn-grade"
+    "wiki-loop-mcp": "bin/wiki-loop-mcp"
   },
   "files": [
     "bin/",
