@@ -161,6 +161,21 @@ for line in sys.stdin:
     printf '\n'
   fi
 
+  # Latest daily pulse — yesterday's or today's curated reflection
+  PULSE_DIR="${HOME}/.prometheus/pulse"
+  if [ -d "$PULSE_DIR" ]; then
+    # Most recent pulse file (sorted reverse, skip context files)
+    LATEST_PULSE="$(ls -1 "$PULSE_DIR"/*.md 2>/dev/null | grep -v -- '-context\.md$' | sort -r | head -1 || true)"
+    if [ -n "$LATEST_PULSE" ] && [ -f "$LATEST_PULSE" ]; then
+      PULSE_DATE="$(basename "$LATEST_PULSE" .md)"
+      # First 30 lines — themes + first 3 cards. Enough to prime without flooding.
+      PULSE_PREVIEW="$(head -40 "$LATEST_PULSE" 2>/dev/null || true)"
+      printf '## Latest daily pulse — %s\n\n' "$PULSE_DATE"
+      printf '```\n%s\n```\n\n' "$PULSE_PREVIEW"
+      printf '_Full file: %s_\n\n' "$LATEST_PULSE"
+    fi
+  fi
+
   # FSRS due cards (learner-model substrate is optional)
   if [ -n "${LEARNER_MODEL_URL:-}" ] || [ -S /tmp/learner-model.sock ]; then
     DUE_URL="${LEARNER_MODEL_URL:-http://localhost:7740}"
