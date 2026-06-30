@@ -1,0 +1,349 @@
+#!/usr/bin/env node
+// wiki-loop-mcp — stdio MCP server exposing the Prometheus self-learning loop
+// as chat-invokable tools. Works in Claude Desktop, Codex, Kimi Desktop,
+// Mavis / MiniMax Desktop, or any MCP-capable chat tool.
+//
+// Tools:
+//   - add_to_wiki(text, source_tag?)   -> compile text into the wiki
+//   - prime_context(topic?)            -> kbd-open snapshot
+//   - search_wiki(query)               -> pk search
+//   - focus_wiki(query, k?)            -> pk focus
+//   - list_recent_learnings(days?)     -> tail ~/.prometheus/learning-log/
+//   - list_wiki_entries()              -> pk list
+//   - list_pending_skill_updates()     -> ~/.prometheus/skill-updates/
+//
+// Implementation: JSON-RPC 2.0 over stdio (no SDK dependency). Spawns the
+// existing kbd-close / kbd-open / pk shells rather than re-implementing them.
+// All tool errors return isError:true; the server never crashes a chat session.
+
+const { spawn } = require('child_process');
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
+
+const HOME = os.homedir();
+const PK = process.env.PK_BIN || path.join(HOME, '.prometheus', 'bin', 'pk');
+const KBD_CLOSE = path.join(HOME, '.local', 'bin', 'kbd-close');
+const KBD_OPEN = path.join(HOME, '.local', 'bin', 'kbd-open');
+const KB_DIR = process.env.PK_KB_DIR || path.join(HOME, '.prometheus', 'knowledge', 'shared');
+const LEARNING_LOG_DIR = path.join(HOME, '.prometheus', 'learning-log');
+const SKILL_UPDATES_DIR = path.join(HOME, '.prometheus', 'skill-updates');
+
+// MCP tool definitions
+const TOOLS = [
+  {
+    name: 'add_to_wiki',
+    description: 'Compile arbitrary text (a conversation, design notes, a summary, etc.) into the Prometheus wiki via pk ingest. Tags the entry with source_tag (default "chat"). Pipeline: pk ingest (compiled via openai-proxy) + learning-log append + propose-skill-update candidate. Always succeeds (returns isError:false even on pk failure).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        text: { type: 'string', description: 'The text to add to the wiki. Can be a full conversation, a design note, or any markdown/text content.' },
+        source_tag: { type: 'string', description: 'Tag for the wiki entry source. Default "chat:<hostname>". Examples: "chat:claude-desktop", "chat:minimax", "chat:kimi", "chat:codex".' },
+      },
+      required: ['text'],
+    },
+  },
+  {
+    name: 'prime_context',
+    description: 'Generate the kbd-open session-prime snapshot — active KBD phase + goals + position reminder + focused wiki context (pk focus) + pending skill-update candidates + today\'s learning log. Returns a markdown snapshot ready to paste at the start of a chat session.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        topic: { type: 'string', description: 'Optional topic to focus the wiki query on. If omitted, derives the topic from the active KBD phase (when available).' },
+      },
+    },
+  },
+  {
+    name: 'search_wiki',
+    description: 'TF-IDF full-text search across the Prometheus wiki. Returns matching entries with titles and tags.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: 'Search query — keywords separated by spaces.' },
+      },
+      required: ['query'],
+    },
+  },
+  {
+    name: 'focus_wiki',
+    description: 'Run pk focus on a topic — retrieves top-k wiki entries and synthesizes a focused brief via the LLM. Use this when you want a ready-to-paste context paragraph rather than raw search hits.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: 'Topic to focus on.' },
+        k: { type: 'integer', description: 'Number of entries to retrieve (default 5).' },
+      },
+      required: ['query'],
+    },
+  },
+  {
+    name: 'list_recent_learnings',
+    description: 'Tail the JSONL learning log. Each line records one session-close event with phase, source, and ingest result. Default: last 7 days.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        days: { type: 'integer', description: 'How many days back to include (default 7).' },
+      },
+    },
+  },
+  {
+    name: 'list_wiki_entries',
+    description: 'List all compiled wiki entries (id + title + revision).',
+    inputSchema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'list_pending_skill_updates',
+    description: 'List pending skill-update candidates from ~/.prometheus/skill-updates/. These are *candidates*, not applied changes — review each with `pmpo-skill-creator --update <name>` or read the file directly.',
+    inputSchema: { type: 'object', properties: {} },
+  },
+];
+
+// Helpers -------------------------------------------------------------------
+
+function send(obj) {
+  process.stdout.write(JSON.stringify(obj) + '\n');
+}
+
+function log(...args) {
+  process.stderr.write('[wiki-loop-mcp] ' + args.map(a => typeof a === 'string' ? a : JSON.stringify(a)).join(' ') + '\n');
+}
+
+function shell(cmd, args, opts = {}) {
+  return new Promise((resolve) => {
+    const child = spawn(cmd, args, { ...opts });
+    let stdout = '', stderr = '';
+    child.stdout.on('data', d => stdout += d.toString());
+    child.stderr.on('data', d => stderr += d.toString());
+    child.on('error', err => resolve({ code: -1, stdout, stderr: stderr + '\nspawn error: ' + err.message }));
+    child.on('close', code => resolve({ code, stdout, stderr }));
+  });
+}
+
+async function shellWithStdin(cmd, args, stdinText, opts = {}) {
+  return new Promise((resolve) => {
+    const child = spawn(cmd, args, { ...opts });
+    let stdout = '', stderr = '';
+    child.stdout.on('data', d => stdout += d.toString());
+    child.stderr.on('data', d => stderr += d.toString());
+    child.on('error', err => resolve({ code: -1, stdout, stderr: stderr + '\nspawn error: ' + err.message }));
+    child.stdin.write(stdinText);
+    child.stdin.end();
+    child.on('close', code => resolve({ code, stdout, stderr }));
+  });
+}
+
+function envWithProm() {
+  // Source ~/.prometheus/.env so CLOUD/LOCAL_LLM_URL are inherited.
+  const env = { ...process.env, PK_KB_DIR: KB_DIR, PATH: `${HOME}/.local/bin:${HOME}/.prometheus/bin:${process.env.PATH || ''}` };
+  const envFile = path.join(HOME, '.prometheus', '.env');
+  if (fs.existsSync(envFile)) {
+    try {
+      const content = fs.readFileSync(envFile, 'utf-8');
+      for (const line of content.split('\n')) {
+        const trimmed = line.trim();
+        if (!trimmed || trimmed.startsWith('#')) continue;
+        const m = trimmed.match(/^([A-Z_][A-Z0-9_]*)=(.*)$/);
+        if (m) {
+          const key = m[1];
+          let val = m[2].replace(/^["']|["']$/g, '');
+          if (val === '__USE_PROXY__') continue;
+          env[key] = val;
+        }
+      }
+    } catch (e) {
+      log('failed to source .env:', e.message);
+    }
+  }
+  return env;
+}
+
+// Tool implementations ------------------------------------------------------
+
+async function addToWiki({ text, source_tag }) {
+  if (!text || !text.trim()) {
+    return { isError: true, content: [{ type: 'text', text: 'text parameter is empty' }] };
+  }
+  const tag = source_tag || `chat:${os.hostname().split('.')[0]}`;
+  // The kbd-close wrapper handles pk-ingest + learning-log + propose-skill-update.
+  // We pre-write the summary to last-session-summary.txt first so kbd-close uses it
+  // as the summary it ingests (and so the user can see it).
+  fs.writeFileSync(path.join(HOME, '.prometheus', 'last-session-summary.txt'), text);
+  const env = envWithProm();
+  env.KBD_CLOSE_SOURCE = tag;
+  const result = await shellWithStdin(KBD_CLOSE, [], text, { env });
+  // Also try to read the latest learning-log entry to surface the wiki slug
+  let wikiSlug = '';
+  try {
+    const today = new Date().toISOString().slice(0, 10);
+    const todayLog = path.join(LEARNING_LOG_DIR, `${today}.jsonl`);
+    if (fs.existsSync(todayLog)) {
+      const lines = fs.readFileSync(todayLog, 'utf-8').split('\n').filter(Boolean);
+      const last = JSON.parse(lines[lines.length - 1]);
+      const m = (last.ingest || '').match(/\[([\w-]+)\]\s*$/);
+      if (m) wikiSlug = m[1];
+    }
+  } catch {}
+  const stdoutTail = result.stdout.split('\n').slice(-5).filter(Boolean).join('\n');
+  return {
+    content: [{
+      type: 'text',
+      text: JSON.stringify({
+        ok: true,
+        source_tag: tag,
+        exit_code: result.code,
+        wiki_slug: wikiSlug || '(unknown — check ~/.prometheus/knowledge/shared/wiki/)',
+        stdout_tail: stdoutTail,
+        learn_more: 'Run pk list to see all entries, or pk focus "your topic" to retrieve this entry.',
+      }, null, 2),
+    }],
+  };
+}
+
+async function primeContext({ topic }) {
+  const env = envWithProm();
+  const result = await shell(KBD_OPEN, [], { env });
+  // kbd-open always exits 0; the snapshot is in stdout
+  return { content: [{ type: 'text', text: result.stdout || '(empty snapshot)' }] };
+}
+
+async function searchWiki({ query }) {
+  const env = envWithProm();
+  const result = await shell(PK, ['search', query, '--kb-dir', KB_DIR], { env });
+  return { content: [{ type: 'text', text: result.stdout || '(no matches)' }] };
+}
+
+async function focusWiki({ query, k }) {
+  const env = envWithProm();
+  const args = ['focus', query, '--kb-dir', KB_DIR];
+  if (k) args.push('--k', String(k));
+  const result = await shell(PK, args, { env });
+  return { content: [{ type: 'text', text: result.stdout || '(no results)' }] };
+}
+
+async function listRecentLearnings({ days }) {
+  const d = Math.max(1, days || 7);
+  const out = [];
+  const now = new Date();
+  for (let i = 0; i < d; i++) {
+    const day = new Date(now.getTime() - i * 86400000).toISOString().slice(0, 10);
+    const path_ = path.join(LEARNING_LOG_DIR, `${day}.jsonl`);
+    if (fs.existsSync(path_)) {
+      const lines = fs.readFileSync(path_, 'utf-8').split('\n').filter(Boolean);
+      out.push(`## ${day} (${lines.length} entries)`);
+      for (const line of lines) {
+        try {
+          const e = JSON.parse(line);
+          const slug = (e.ingest || '').match(/\[([\w-]+)\]/)?.[1] || '';
+          out.push(`- ${e.ts || ''} · phase=${e.kbd_phase || '-'} · src=${e.source || ''}${slug ? ' · wiki=' + slug : ''}`);
+        } catch {
+          out.push(`- (parse failed) ${line.slice(0, 100)}`);
+        }
+      }
+      out.push('');
+    }
+  }
+  return { content: [{ type: 'text', text: out.join('\n') || '(no learnings in last ' + d + ' days)' }] };
+}
+
+async function listWikiEntries() {
+  const env = envWithProm();
+  const result = await shell(PK, ['list', '--kb-dir', KB_DIR], { env });
+  return { content: [{ type: 'text', text: result.stdout || '(empty wiki)' }] };
+}
+
+async function listPendingSkillUpdates() {
+  if (!fs.existsSync(SKILL_UPDATES_DIR)) {
+    return { content: [{ type: 'text', text: '(no skill-updates directory)' }] };
+  }
+  const entries = fs.readdirSync(SKILL_UPDATES_DIR, { withFileTypes: true })
+    .filter(e => e.isFile())
+    .map(e => {
+      const full = path.join(SKILL_UPDATES_DIR, e.name);
+      const stat = fs.statSync(full);
+      return `- ${e.name} (${stat.size} bytes, mtime ${stat.mtime.toISOString()})`;
+    });
+  return { content: [{ type: 'text', text: entries.length ? entries.join('\n') : '(no pending candidates)' }] };
+}
+
+const TOOL_HANDLERS = {
+  add_to_wiki: addToWiki,
+  prime_context: primeContext,
+  search_wiki: searchWiki,
+  focus_wiki: focusWiki,
+  list_recent_learnings: listRecentLearnings,
+  list_wiki_entries: listWikiEntries,
+  list_pending_skill_updates: listPendingSkillUpdates,
+};
+
+// MCP JSON-RPC handler ------------------------------------------------------
+
+async function handleRequest(req) {
+  const { id, method, params } = req;
+  try {
+    switch (method) {
+      case 'initialize':
+        return {
+          jsonrpc: '2.0',
+          id,
+          result: {
+            protocolVersion: '2024-11-05',
+            serverInfo: { name: 'wiki-loop-mcp', version: '1.0.0' },
+            capabilities: { tools: {} },
+          },
+        };
+
+      case 'notifications/initialized':
+        // client confirmation; no response
+        return null;
+
+      case 'ping':
+        return { jsonrpc: '2.0', id, result: {} };
+
+      case 'tools/list':
+        return { jsonrpc: '2.0', id, result: { tools: TOOLS } };
+
+      case 'tools/call': {
+        const name = params?.name;
+        const args = params?.arguments || {};
+        const handler = TOOL_HANDLERS[name];
+        if (!handler) {
+          return { jsonrpc: '2.0', id, error: { code: -32601, message: `Unknown tool: ${name}` } };
+        }
+        const result = await handler(args);
+        return { jsonrpc: '2.0', id, result };
+      }
+
+      default:
+        return { jsonrpc: '2.0', id, error: { code: -32601, message: `Method not found: ${method}` } };
+    }
+  } catch (err) {
+    log('handler error:', err.stack || err.message);
+    return { jsonrpc: '2.0', id, error: { code: -32603, message: 'Internal error: ' + err.message } };
+  }
+}
+
+// Main loop -----------------------------------------------------------------
+
+let buffer = '';
+process.stdin.setEncoding('utf-8');
+process.stdin.on('data', async (chunk) => {
+  buffer += chunk;
+  let nl;
+  while ((nl = buffer.indexOf('\n')) !== -1) {
+    const line = buffer.slice(0, nl).trim();
+    buffer = buffer.slice(nl + 1);
+    if (!line) continue;
+    let req;
+    try { req = JSON.parse(line); }
+    catch (e) { log('parse error:', e.message, 'line:', line.slice(0, 200)); continue; }
+    if (req.jsonrpc !== '2.0') continue;
+    const resp = await handleRequest(req);
+    if (resp) send(resp);
+  }
+});
+
+process.stdin.on('end', () => process.exit(0));
+process.on('SIGTERM', () => process.exit(0));
+process.on('SIGINT', () => process.exit(0));
+
+log('wiki-loop-mcp started; PK=' + PK + ' KB_DIR=' + KB_DIR);

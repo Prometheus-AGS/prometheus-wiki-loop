@@ -1,0 +1,177 @@
+#!/usr/bin/env bash
+# kbd-open — Session-prime companion to kbd-close.
+#
+# Runs at session START (or any time you want context primed):
+#   1. Detect active KBD phase from .kbd-orchestrator/current-waypoint.json
+#   2. Read .kbd-orchestrator/position-reminder.txt if present
+#   3. Pull focused wiki context via pk focus on the phase name + goals
+#   4. Surface any pending skill-update candidates from ~/.prometheus/skill-updates/
+#   5. Surface today's learning-log entries
+#   6. (optional) Check FSRS due cards via the learner-model substrate
+#
+# Output goes to stdout (so it can be piped or captured to a file the agent reads).
+# Also writes a snapshot to ~/.prometheus/last-open-snapshot.txt.
+# Always exits 0.
+
+set -uo pipefail
+
+LOG_DIR="${HOME}/.prometheus/logs"
+LOG_FILE="${LOG_DIR}/kbd-open.log"
+LEARNING_LOG="${HOME}/.prometheus/learning-log"
+SKILL_UPDATES_DIR="${HOME}/.prometheus/skill-updates"
+SNAPSHOT="${HOME}/.prometheus/last-open-snapshot.txt"
+SCRIPT_NAME="kbd-open"
+
+mkdir -p "$LOG_DIR" 2>/dev/null || true
+
+log() {
+  printf '[%s] [%s] %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$SCRIPT_NAME" "$*" >> "$LOG_FILE" 2>/dev/null || true
+}
+
+# Source env so pk uses the proxy route
+if [ -f "${HOME}/.prometheus/.env" ]; then
+  set -a
+  . "${HOME}/.prometheus/.env"
+  set +a
+fi
+
+# Make pk available
+if [ -x "${HOME}/.prometheus/bin/pk" ]; then
+  export PATH="${HOME}/.prometheus/bin:${PATH}"
+fi
+
+# --- Find KBD root ---
+find_kbd_root() {
+  local dir="${1:-$PWD}"
+  while [ "$dir" != "/" ]; do
+    if [ -d "$dir/.kbd-orchestrator" ]; then
+      printf '%s' "$dir"
+      return 0
+    fi
+    dir="$(dirname "$dir")"
+  done
+  return 1
+}
+
+KBD_ROOT="$(find_kbd_root "$(pwd)" 2>/dev/null || true)"
+KBD_PHASE=""
+KBD_PROJECT=""
+KBD_GOALS=""
+
+if [ -n "$KBD_ROOT" ]; then
+  if [ -f "$KBD_ROOT/.kbd-orchestrator/current-waypoint.json" ]; then
+    KBD_PHASE="$(python3 -c "
+import json, sys
+try:
+    with open('$KBD_ROOT/.kbd-orchestrator/current-waypoint.json') as f:
+        d = json.load(f)
+    print(d.get('active_phase') or d.get('phase') or '')
+except Exception:
+    pass
+" 2>/dev/null)"
+  fi
+
+  if [ -f "$KBD_ROOT/.kbd-orchestrator/project.json" ]; then
+    KBD_PROJECT="$(python3 -c "
+import json, sys
+try:
+    with open('$KBD_ROOT/.kbd-orchestrator/project.json') as f:
+        d = json.load(f)
+    print(d.get('name') or '')
+except Exception:
+    pass
+" 2>/dev/null)"
+  fi
+
+  if [ -n "$KBD_PHASE" ] && [ -f "$KBD_ROOT/.kbd-orchestrator/phases/$KBD_PHASE/goals.md" ]; then
+    KBD_GOALS="$(head -50 "$KBD_ROOT/.kbd-orchestrator/phases/$KBD_PHASE/goals.md" 2>/dev/null || true)"
+  fi
+fi
+
+# --- Build the output ---
+{
+  printf '# kbd-open session snapshot\n'
+  printf '_generated: %s_\n\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+
+  if [ -n "$KBD_PHASE" ]; then
+    printf '## Active KBD phase\n'
+    printf -- '- **project**: %s\n' "${KBD_PROJECT:-unspecified}"
+    printf -- '- **phase**: %s\n' "$KBD_PHASE"
+    printf -- '- **kbd_root**: %s\n' "$KBD_ROOT"
+    printf '\n'
+  fi
+
+  # Position reminder (set by Claude Code hooks if active)
+  if [ -f "${HOME}/.claude/hooks/position-reminder.txt" ] || [ -f "$KBD_ROOT/.kbd-orchestrator/position-reminder.txt" ]; then
+    REMINDER="${KBD_ROOT:+$KBD_ROOT/.kbd-orchestrator/position-reminder.txt}"
+    REMINDER="${REMINDER:-$HOME/.claude/hooks/position-reminder.txt}"
+    if [ -f "$REMINDER" ]; then
+      printf '## Position reminder\n```\n%s\n```\n\n' "$(cat "$REMINDER" | head -30)"
+    fi
+  fi
+
+  # Phase goals
+  if [ -n "$KBD_GOALS" ]; then
+    printf '## Phase goals\n%s\n\n' "$KBD_GOALS"
+  fi
+
+  # Focused wiki context
+  if command -v pk >/dev/null 2>&1; then
+    FOCUS_QUERY="${KBD_PHASE:-prometheus self-learning loop}"
+    FOCUS_K=5
+    if [ -n "$KBD_GOALS" ]; then
+      # Combine phase name + first line of goals for richer query
+      FOCUS_QUERY="${KBD_PHASE} $(echo "$KBD_GOALS" | head -3 | tr '\n' ' ' | head -c 200)"
+    fi
+    printf '## Wiki context (`pk focus "%s")\n\n' "$FOCUS_QUERY"
+    FOCUS_OUT="$(pk focus "$FOCUS_QUERY" --k "$FOCUS_K" --kb-dir "${HOME}/.prometheus/knowledge/shared" 2>/dev/null || true)"
+    if [ -n "$FOCUS_OUT" ]; then
+      printf '%s\n\n' "$FOCUS_OUT"
+    else
+      printf '_no matches in wiki (try seeding with `pk ingest <file>`)_\n\n'
+    fi
+  fi
+
+  # Pending skill-update candidates
+  if [ -d "$SKILL_UPDATES_DIR" ] && [ -n "$(ls -A "$SKILL_UPDATES_DIR" 2>/dev/null)" ]; then
+    N_CANDIDATES="$(ls -1 "$SKILL_UPDATES_DIR" 2>/dev/null | wc -l | tr -d ' ')"
+    printf '## Pending skill-update candidates (%s)\n\n' "$N_CANDIDATES"
+    ls -la "$SKILL_UPDATES_DIR" 2>/dev/null | head -10
+    printf '\n_Review with `/pmpo-skill-creator --update <name>`_\n\n'
+  fi
+
+  # Today's learning log
+  TODAY_LOG="${LEARNING_LOG}/$(date -u '+%Y-%m-%d').jsonl"
+  if [ -f "$TODAY_LOG" ]; then
+    N_ENTRIES="$(wc -l < "$TODAY_LOG" | tr -d ' ')"
+    printf '## Today'\''s learning log (%s entries)\n\n' "$N_ENTRIES"
+    tail -3 "$TODAY_LOG" | python3 -c "
+import sys, json
+for line in sys.stdin:
+    line = line.strip()
+    if not line: continue
+    try:
+        d = json.loads(line)
+        print(f\"- {d.get('ts','')} · {d.get('kbd_phase','-')} · {d.get('source','')}\")
+        ingest = (d.get('ingest') or '').split('→')[-1].strip()[:80]
+        if ingest: print(f'  └─ {ingest}')
+    except Exception:
+        print(f'- (parse failed) {line[:100]}')
+" 2>/dev/null || tail -3 "$TODAY_LOG"
+    printf '\n'
+  fi
+
+  # FSRS due cards (learner-model substrate is optional)
+  if [ -n "${LEARNER_MODEL_URL:-}" ] || [ -S /tmp/learner-model.sock ]; then
+    DUE_URL="${LEARNER_MODEL_URL:-http://localhost:7740}"
+    DUE_OUT="$(curl -sf --max-time 3 "$DUE_URL/api/v1/due" 2>/dev/null || true)"
+    if [ -n "$DUE_OUT" ] && [ "$DUE_OUT" != "[]" ]; then
+      printf '## FSRS due cards (review with `/learn-retain`)\n```json\n%s\n```\n\n' "$(echo "$DUE_OUT" | python3 -c "import sys,json; print(json.dumps(json.loads(sys.stdin.read()), indent=2))" 2>/dev/null || echo "$DUE_OUT")"
+    fi
+  fi
+
+  printf -- '---\n_end of snapshot_\n'
+} | tee "$SNAPSHOT"
+
+log "snapshot written to $SNAPSHOT"
+exit 0

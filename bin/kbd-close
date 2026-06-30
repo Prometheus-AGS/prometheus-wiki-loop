@@ -1,0 +1,259 @@
+#!/usr/bin/env bash
+# kbd-close — Universal session-close hook for the Prometheus self-learning loop.
+#
+# Works from any tool:
+#   - Claude Code Stop hook (auto-fires on session end, after restart with plugin)
+#   - Claude Code PreCompact hook (auto-fires before context-window compaction)
+#   - Codex turn-ended notify (reads JSON payload from stdin)
+#   - OpenCode plugin tool (agent calls kbd-close)
+#   - Manual: `kbd-close <file.md>` or `echo "$summary" | kbd-close` or just `kbd-close`
+#
+# Pipeline (always runs in this order):
+#   1. read summary text (stdin / file / last-session-summary.txt)
+#   2. detect active KBD phase from .kbd-orchestrator/current-waypoint.json
+#   3. enrich summary with phase context (goals, position reminder)
+#   4. refresh canonical summary file
+#   5. pk ingest (compile raw → wiki via the openai-proxy, tagged with phase name)
+#   6. append JSONL entry to learning-log
+#   7. propose-skill-update.sh (candidates only, never applied)
+#   8. log result
+#
+# Always exits 0 so a hook failure never breaks the calling tool.
+#
+# Environment: sources ~/.prometheus/.env so PK_COMPILE_MODEL, CLOUD/LOCAL_LLM_URL
+# are inherited. Falls back to a no-op if pk / the proxy / env are unreachable.
+
+set -uo pipefail
+
+LOG_DIR="${HOME}/.prometheus/logs"
+LOG_FILE="${LOG_DIR}/kbd-close.log"
+LEARNING_LOG="${HOME}/.prometheus/learning-log"
+SKILL_PACK_ROOT="${PROMETHEUS_SKILL_PACK_ROOT:-}"
+SCRIPT_NAME="kbd-close"
+KBD_PHASE=""
+KBD_PHASE_GOALS=""
+KBD_PROJECT=""
+
+mkdir -p "$LOG_DIR" "$LEARNING_LOG" 2>/dev/null || true
+
+log() {
+  printf '[%s] [%s] %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$SCRIPT_NAME" "$*" >> "$LOG_FILE" 2>/dev/null || true
+}
+
+# Source env so pk uses the proxy route
+if [ -f "${HOME}/.prometheus/.env" ]; then
+  set -a
+  . "${HOME}/.prometheus/.env"
+  set +a
+fi
+
+# --- Step 1: collect summary text ---
+SUMMARY_TEXT=""
+SOURCE_TAG="${KBD_CLOSE_SOURCE:-manual}"
+
+# 1a. explicit file argument
+if [ $# -ge 1 ] && [ -f "$1" ]; then
+  SUMMARY_TEXT="$(cat "$1")"
+  SOURCE_TAG="${KBD_CLOSE_SOURCE:-manual:$(basename "$1")}"
+  log "read from file: $1 (${#SUMMARY_TEXT} chars)"
+
+# 1b. stdin (Codex notify JSON, or `echo "..." | kbd-close`)
+elif [ ! -t 0 ]; then
+  STDIN_RAW="$(cat)"
+  if [ -z "$STDIN_RAW" ]; then
+    log "stdin empty; falling back"
+  else
+    # Try to extract a meaningful text field from Codex's notify JSON.
+    # Codex's payload shape is undocumented; we try several known field names.
+    EXTRACTED="$(printf '%s' "$STDIN_RAW" | python3 -c "
+import sys, json
+try:
+    data = json.loads(sys.stdin.read())
+except Exception:
+    print(''); sys.exit(0)
+
+def walk(obj, depth=0):
+    if depth > 6: return ''
+    if isinstance(obj, dict):
+        for key in ('last_assistant_message', 'message', 'content', 'text',
+                    'summary', 'transcript', 'response', 'output'):
+            if key in obj:
+                v = obj[key]
+                if isinstance(v, str) and len(v) > 20:
+                    return v
+                if isinstance(v, list):
+                    s = ' '.join(str(x) for x in v if isinstance(x, str))
+                    if len(s) > 20: return s
+        for v in obj.values():
+            r = walk(v, depth + 1)
+            if r: return r
+    elif isinstance(obj, list):
+        for item in obj:
+            r = walk(item, depth + 1)
+            if r: return r
+    return ''
+
+print(walk(data))
+" 2>/dev/null)"
+
+    if [ -n "$EXTRACTED" ]; then
+      SUMMARY_TEXT="$EXTRACTED"
+      SOURCE_TAG="${KBD_CLOSE_SOURCE:-stdin-json}"
+      log "extracted ${#SUMMARY_TEXT} chars from stdin JSON"
+    elif printf '%s' "$STDIN_RAW" | grep -qE '^[[:space:]]*[A-Za-z]'; then
+      # Plain text on stdin
+      SUMMARY_TEXT="$STDIN_RAW"
+      SOURCE_TAG="${KBD_CLOSE_SOURCE:-stdin-text}"
+      log "read ${#SUMMARY_TEXT} chars from stdin text"
+    fi
+  fi
+
+# 1c. fall back to last-session-summary.txt
+elif [ -f "${HOME}/.prometheus/last-session-summary.txt" ]; then
+  SUMMARY_TEXT="$(cat "${HOME}/.prometheus/last-session-summary.txt")"
+  SOURCE_TAG="${KBD_CLOSE_SOURCE:-fallback-summary}"
+  log "read fallback summary (${#SUMMARY_TEXT} chars)"
+fi
+
+if [ -z "$SUMMARY_TEXT" ]; then
+  log "no summary text available — skipping"
+  exit 0
+fi
+
+# Truncate absurd inputs (avoid feeding the LLM 50MB of repo)
+MAX_CHARS=200000
+if [ "${#SUMMARY_TEXT}" -gt "$MAX_CHARS" ]; then
+  log "truncating summary from ${#SUMMARY_TEXT} to $MAX_CHARS chars"
+  SUMMARY_TEXT="${SUMMARY_TEXT:0:$MAX_CHARS}"
+fi
+
+# --- Step 2: detect active KBD phase ---
+# Walks up from cwd to find .kbd-orchestrator/current-waypoint.json
+find_kbd_root() {
+  local dir="${1:-$PWD}"
+  while [ "$dir" != "/" ]; do
+    if [ -d "$dir/.kbd-orchestrator" ]; then
+      printf '%s' "$dir"
+      return 0
+    fi
+    dir="$(dirname "$dir")"
+  done
+  return 1
+}
+
+KBD_ROOT="$(find_kbd_root "$(pwd)" 2>/dev/null || true)"
+if [ -n "$KBD_ROOT" ] && [ -f "$KBD_ROOT/.kbd-orchestrator/current-waypoint.json" ]; then
+  KBD_PHASE="$(python3 -c "
+import json, sys
+try:
+    with open('$KBD_ROOT/.kbd-orchestrator/current-waypoint.json') as f:
+        d = json.load(f)
+    print(d.get('active_phase') or d.get('phase') or d.get('name') or '')
+except Exception:
+    pass
+" 2>/dev/null)"
+
+  # Project name
+  if [ -f "$KBD_ROOT/.kbd-orchestrator/project.json" ]; then
+    KBD_PROJECT="$(python3 -c "
+import json, sys
+try:
+    with open('$KBD_ROOT/.kbd-orchestrator/project.json') as f:
+        d = json.load(f)
+    print(d.get('name') or d.get('project') or '')
+except Exception:
+    pass
+" 2>/dev/null)"
+  fi
+
+  # Phase goals from goals.md
+  if [ -f "$KBD_ROOT/.kbd-orchestrator/phases/$KBD_PHASE/goals.md" ]; then
+    KBD_PHASE_GOALS="$(head -30 "$KBD_ROOT/.kbd-orchestrator/phases/$KBD_PHASE/goals.md" 2>/dev/null || true)"
+  fi
+
+  if [ -n "$KBD_PHASE" ]; then
+    log "detected KBD phase: $KBD_PHASE (project: ${KBD_PROJECT:-none}, root: $KBD_ROOT)"
+    # Re-tag the source with the phase
+    SOURCE_TAG="${KBD_CLOSE_SOURCE:-manual}:${KBD_PROJECT:+${KBD_PROJECT}/}${KBD_PHASE}"
+  fi
+fi
+
+# --- Step 3: enrich summary with phase context ---
+if [ -n "$KBD_PHASE" ]; then
+  ENRICH_HEADER="<!-- KBD Phase Context
+phase: ${KBD_PHASE}
+project: ${KBD_PROJECT:-unspecified}
+kbd_root: ${KBD_ROOT}
+captured_at: $(date -u '+%Y-%m-%dT%H:%M:%SZ')
+source: ${SOURCE_TAG}
+-->
+"
+  if [ -n "$KBD_PHASE_GOALS" ]; then
+    ENRICH_HEADER="${ENRICH_HEADER}
+
+## Phase goals
+${KBD_PHASE_GOALS}
+
+## Session summary
+
+"
+  else
+    ENRICH_HEADER="${ENRICH_HEADER}
+
+## Session summary
+
+"
+  fi
+  SUMMARY_TEXT="${ENRICH_HEADER}${SUMMARY_TEXT}"
+fi
+
+# --- Step 4: refresh canonical summary file ---
+printf '%s' "$SUMMARY_TEXT" > "${HOME}/.prometheus/last-session-summary.txt" 2>/dev/null || true
+
+# --- Step 5: pk ingest (compile raw → wiki) ---
+if ! command -v pk >/dev/null 2>&1; then
+  # Try the explicit install path
+  if [ -x "${HOME}/.prometheus/bin/pk" ]; then
+    export PATH="${HOME}/.prometheus/bin:${PATH}"
+  else
+    log "pk not found — skipping ingest"
+    exit 0
+  fi
+fi
+
+TIMESTAMP="$(date -u '+%Y-%m-%d')"
+INGEST_SOURCE="${SOURCE_TAG}:${TIMESTAMP}"
+
+# Always write to shared scope (cross-project canonical wiki).
+# Pipe summary via stdin to avoid arg-list-too-long on big inputs.
+# Auto-answer "y" to the shared-scope confirmation prompt.
+INGEST_OUT="$(printf 'y\n%s' "$SUMMARY_TEXT" | pk ingest --source "$INGEST_SOURCE" --scope shared 2>&1)" || true
+log "pk ingest: $(echo "$INGEST_OUT" | tail -1)"
+
+# --- Step 6: learning-log entry ---
+LOG_FILE_TODAY="${LEARNING_LOG}/$(date -u '+%Y-%m-%d').jsonl"
+LEARN_ENTRY="$(printf '{"ts":"%s","source":"%s","ingest":"%s","summary_chars":%d,"kbd_phase":"%s","kbd_project":"%s"}' \
+  "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+  "$INGEST_SOURCE" \
+  "$(echo "$INGEST_OUT" | head -1 | sed 's/"/\\"/g' | head -c 200)" \
+  "${#SUMMARY_TEXT}" \
+  "${KBD_PHASE:-}" \
+  "${KBD_PROJECT:-}")"
+
+printf '%s\n' "$LEARN_ENTRY" >> "$LOG_FILE_TODAY" 2>/dev/null || true
+log "learning-log entry written to $(basename "$LOG_FILE_TODAY")"
+
+# --- Step 7: propose skill update candidate ---
+if [ -x "${SKILL_PACK_ROOT}/shared/scripts/propose-skill-update.sh" ]; then
+  bash "${SKILL_PACK_ROOT}/shared/scripts/propose-skill-update.sh" >> "$LOG_FILE" 2>&1 || true
+  log "propose-skill-update.sh invoked"
+fi
+
+# --- Step 6: optional symlink-update via forge (if available) ---
+if command -v forge >/dev/null 2>&1 && [ -d ".forge/iterations" ]; then
+  forge reflect >> "$LOG_FILE" 2>&1 || true
+  log "forge reflect invoked"
+fi
+
+log "done"
+exit 0
