@@ -44,13 +44,24 @@ echo "wiki-loop-mcp"
 RESP="$(printf '%s\n%s\n' \
   '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"smoke","version":"0"}}}' \
   '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' \
-  | wiki-loop-mcp 2>/dev/null | grep -c '"name":')"
+  | wiki-loop-mcp 2>/dev/null)"
 
-if [ "$RESP" -ge 5 ]; then
-  echo "  ✅ wiki-loop-mcp: tools/list returned 5+ tools ($RESP hits)"
+# Count individual tool names in the tools/list response.
+# Expected tools: add_to_wiki, prime_context, search_wiki, focus_wiki,
+# list_recent_learnings, list_wiki_entries, list_pending_skill_updates.
+EXPECTED=7
+HITS=0
+for tool in add_to_wiki prime_context search_wiki focus_wiki list_recent_learnings list_wiki_entries list_pending_skill_updates; do
+  if echo "$RESP" | grep -q "\"name\":\"$tool\""; then
+    HITS=$((HITS + 1))
+  fi
+done
+
+if [ "$HITS" -eq "$EXPECTED" ]; then
+  echo "  ✅ wiki-loop-mcp: tools/list returned all $EXPECTED tools ($HITS/$EXPECTED)"
   PASS=$((PASS + 1))
 else
-  echo "  ❌ wiki-loop-mcp: tools/list returned only $RESP hits"
+  echo "  ❌ wiki-loop-mcp: tools/list returned $HITS/$EXPECTED tools"
   FAIL=$((FAIL + 1))
 fi
 
